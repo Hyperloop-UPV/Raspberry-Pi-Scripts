@@ -1,0 +1,450 @@
+---
+title: "Hyperloop Gateway — System Monitor Report"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    fig_width: 8
+    fig_height: 3.5
+    latex_engine: xelatex
+header-includes:
+  - \usepackage{fancyhdr}
+  - \usepackage{lastpage}
+  - \usepackage{booktabs}
+  - \pagestyle{fancy}
+  - \fancyhf{}
+  - \fancyhead[L]{\textbf{Hyperloop-UPV} \textnormal{| Software}}
+  - \fancyhead[R]{\today}
+  - \fancyfoot[C]{Page \thepage\ of \pageref{LastPage}}
+  - \renewcommand{\headrulewidth}{0.4pt}
+  - \renewcommand{\footrulewidth}{0.4pt}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE
+)
+
+library(tidyverse)
+library(scales)
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+
+CSV_PATH <- "snapshot.csv"
+
+df_raw <- read_csv(CSV_PATH, show_col_types = FALSE)
+
+df <- df_raw %>%
+  mutate(
+    t    = as.POSIXct(timestamp_start, format = "%Y-%m-%d %H:%M:%S"),
+    snap = row_number()
+  )
+
+if (!"ram_used_pct" %in% names(df))
+  df <- df %>% mutate(ram_used_pct  = round(ram_used_mb  / ram_total_mb * 100, 1))
+if (!"ram_avail_pct" %in% names(df))
+  df <- df %>% mutate(ram_avail_pct = round(ram_avail_mb / ram_total_mb * 100, 1))
+if (!"swap_used_pct" %in% names(df) && "swap_total_mb" %in% names(df))
+  df <- df %>% mutate(swap_used_pct = round(swap_used_mb / swap_total_mb * 100, 1))
+
+# ── Theme ─────────────────────────────────────────────────────────────────────
+
+hyperloop_theme <- theme_minimal(base_size = 10) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 11),
+    plot.subtitle    = element_text(color = "grey40", size = 9),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(angle = 30, hjust = 1, size = 8),
+    legend.position  = "bottom",
+    legend.title     = element_blank()
+  )
+
+theme_set(hyperloop_theme)
+
+use_time <- n_distinct(df$t) > 1
+x_var    <- if (use_time) "t" else "snap"
+x_label  <- if (use_time) "Time" else "Snapshot #"
+
+CLR <- c(
+  user    = "#2166ac",
+  sys     = "#d6604d",
+  iowait  = "#f4a582",
+  irq     = "#92c5de",
+  softirq = "#4dac26"
+)
+
+# ── Detect interfaces ─────────────────────────────────────────────────────────
+
+rx_cols  <- names(df) %>% str_subset("_rx_bytes_per_s$")
+ifaces   <- str_remove(rx_cols, "_rx_bytes_per_s$")
+```
+
+\newpage
+
+# Introduction
+
+This report summarises the health and performance of the **Raspberry Pi** that acts as the central communication gateway of the Hyperloop-UPV vehicle. Its main job is to receive data packets sent by the different electronic boards on board (sensors, controllers, etc.) and route them to their destination.
+
+Each measurement corresponds to a **sampling window of `r df$period_s[1]` seconds**. During that window the monitoring script counted how much activity occurred and calculated rates per second, so the values reflect the actual load on the Pi at that moment.
+
+The report is structured as follows:
+
+1. **System Summary** — quick overview table of the whole session
+2. **CPU** — how busy the processor was and whether it overheated
+3. **Memory** — whether the Pi had enough working memory
+4. **Network** — how much data flowed through each network port
+5. **UDP Traffic** — the specific communication protocol used by the boards, and whether any data was lost
+
+\newpage
+
+# System Summary
+
+The table below shows the most relevant figures for the full monitoring session. It is intended as a first screening: if all values look reasonable here, the rest of the report provides the detail behind them.
+
+```{r summary-table}
+summary_df <- df %>%
+  summarise(
+    Snapshots           = as.character(n()),
+    `Sampling period`   = paste0(first(period_s), " s"),
+    `Session start`     = format(min(t), "%Y-%m-%d %H:%M:%S"),
+    `Session end`       = format(max(t), "%Y-%m-%d %H:%M:%S"),
+    `CPU usage — max`   = paste0(max(cpu_usage_pct,  na.rm = TRUE), "%"),
+    `CPU usage — mean`  = paste0(round(mean(cpu_usage_pct, na.rm = TRUE), 1), "%"),
+    `CPU temp — max`    = paste0(max(cpu_temp_c, na.rm = TRUE), "°C"),
+    `RAM used — max`    = paste0(max(ram_used_pct, na.rm = TRUE), "%"),
+    `UDP drops (total)` = as.character(sum(udp_recv_buf_errors, na.rm = TRUE))
+  ) %>%
+  pivot_longer(everything(), names_to = "Metric", values_to = "Value")
+
+knitr::kable(summary_df, booktabs = TRUE, align = c("l", "r"),
+             caption = "Key figures for the full monitoring session")
+```
+
+\newpage
+
+# CPU
+
+The **CPU (Central Processing Unit)** is the brain of the Raspberry Pi. It runs the operating system, the routing software, and processes every packet that arrives from the vehicle's boards. A CPU that is consistently near 100% has no spare capacity to handle unexpected bursts of traffic — in a real-time system like Hyperloop this can cause data loss or delayed responses.
+
+CPU usage is expressed as a **percentage of total capacity**: 0% means idle, 100% means completely saturated. Values above **80% sustained** are a warning sign.
+
+## Usage breakdown
+
+The chart below shows how the CPU time was distributed across different types of work during each measurement window. The coloured areas stack on top of each other to form the total usage (also shown as the dashed black line):
+
+| Colour | Category | What it means |
+|--------|----------|---------------|
+| Blue   | user     | Application software (routing daemon, data logger, etc.) |
+| Red    | sys      | Operating system kernel — moving data between interfaces |
+| Orange | iowait   | Waiting for the SD card; high values indicate excessive logging |
+| Light blue | irq  | Hardware interrupt handling |
+| Green  | softirq  | Network interrupt handling — **expected to be significant** with heavy UDP |
+
+```{r cpu-usage}
+cpu_long <- df %>%
+  select(t, snap, cpu_user_pct, cpu_sys_pct, cpu_iowait_pct,
+         cpu_irq_pct, cpu_softirq_pct) %>%
+  pivot_longer(-c(t, snap), names_to = "mode", values_to = "pct") %>%
+  mutate(mode = str_remove(mode, "_pct") %>% str_remove("cpu_"))
+
+ggplot(cpu_long, aes(x = .data[[x_var]], y = pct, fill = mode)) +
+  geom_area(alpha = 0.85, position = "stack") +
+  geom_line(
+    data = df, aes(x = .data[[x_var]], y = cpu_usage_pct),
+    inherit.aes = FALSE, color = "black", linewidth = 0.5, linetype = "dashed"
+  ) +
+  scale_fill_manual(values = CLR) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 100)) +
+  labs(title    = "CPU usage breakdown",
+       subtitle = "Stacked areas = usage categories — dashed line = total usage",
+       x = x_label, y = "CPU (%)")
+```
+
+```{r cpu-usage-interpretation, results='asis'}
+cpu_max  <- max(df$cpu_usage_pct, na.rm = TRUE)
+cpu_mean <- round(mean(df$cpu_usage_pct, na.rm = TRUE), 1)
+cpu_dom  <- df %>%
+  summarise(across(c(cpu_user_pct, cpu_sys_pct, cpu_iowait_pct,
+                     cpu_irq_pct, cpu_softirq_pct), mean, na.rm = TRUE)) %>%
+  pivot_longer(everything()) %>%
+  slice_max(value, n = 1) %>%
+  pull(name) %>%
+  str_remove("_pct") %>% str_remove("cpu_")
+
+status <- if (cpu_max > 80) "**Warning:** the CPU reached a critical level." else
+          if (cpu_max > 50) "The CPU showed moderate load." else
+          "The CPU remained well within safe limits."
+
+cat(sprintf(
+  "\n**Reading this chart:** During this session CPU usage peaked at **%s%%** and averaged **%s%%**. The dominant cost was **%s** activity. %s If the total line (dashed) is frequently above 80%%, consider reducing the processing load on the Pi.",
+  cpu_max, cpu_mean, cpu_dom, status
+))
+```
+
+## Temperature
+
+The Raspberry Pi has a built-in thermometer on the chip. **Temperature matters** because above **80°C** the Pi automatically reduces its clock speed (thermal throttling) to protect itself — this directly reduces its ability to process packets. In the enclosed environment of the vehicle, with no forced airflow, temperatures tend to be higher than on a bench.
+
+```{r cpu-temp}
+ggplot(df, aes(x = .data[[x_var]], y = cpu_temp_c)) +
+  geom_line(color = "#d6604d", linewidth = 1) +
+  geom_point(color = "#d6604d", size = 2) +
+  geom_hline(yintercept = 80, linetype = "dashed", color = "red", linewidth = 0.6) +
+  scale_y_continuous(labels = function(x) paste0(x, "°C")) +
+  labs(title    = "CPU temperature over time",
+       subtitle = "Dashed red line = throttle threshold (80°C)",
+       x = x_label, y = "Temperature (°C)")
+```
+
+```{r cpu-temp-interpretation, results='asis'}
+temp_max <- max(df$cpu_temp_c, na.rm = TRUE)
+temp_min <- min(df$cpu_temp_c, na.rm = TRUE)
+
+status <- if (temp_max >= 80) "**Warning:** the Pi reached or exceeded the throttle threshold. Performance may have been reduced during this session." else
+          if (temp_max >= 70) "The temperature is getting close to the throttle threshold. This should be monitored during longer runs." else
+          "Temperature remained in a safe range throughout the session."
+
+cat(sprintf(
+  "\n**Reading this chart:** Temperature ranged from **%s°C** to **%s°C**. %s",
+  temp_min, temp_max, status
+))
+```
+
+\newpage
+
+# Memory (RAM)
+
+**RAM (Random Access Memory)** is the fast working memory the Pi uses to keep the operating system and all running programs active simultaneously. Unlike the SD card, RAM is very fast but limited — the Pi has a fixed amount that cannot be expanded.
+
+If RAM fills up completely the Pi will either crash or start using the SD card as emergency overflow memory (called *swap*), which is thousands of times slower. Either outcome is unacceptable during a run.
+
+The chart shows two lines:
+
+- **Used (red)** — the percentage of RAM currently occupied
+- **Available (blue)** — the percentage still free for new tasks; this is the critical figure to watch
+
+A system with less than **10% available** RAM is at risk of instability.
+
+```{r memory}
+mem_long <- df %>%
+  select(t, snap, `Used` = ram_used_pct, `Available` = ram_avail_pct) %>%
+  pivot_longer(-c(t, snap), names_to = "type", values_to = "pct")
+
+ggplot(mem_long, aes(x = .data[[x_var]], y = pct, color = type, group = type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c(Used = "#d6604d", Available = "#2166ac")) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 100)) +
+  labs(title    = "RAM usage over time",
+       subtitle = paste0("Total installed: ", df$ram_total_mb[1], " MB"),
+       x = x_label, y = "RAM (%)")
+```
+
+```{r memory-interpretation, results='asis'}
+ram_used_max  <- max(df$ram_used_pct,  na.rm = TRUE)
+ram_avail_min <- min(df$ram_avail_pct, na.rm = TRUE)
+
+status <- if (ram_avail_min < 10) "**Warning:** available RAM dropped below 10%. The system was close to memory exhaustion." else
+          if (ram_avail_min < 25) "RAM headroom was limited. Monitor this metric during longer or more intensive runs." else
+          "RAM headroom was comfortable throughout the session."
+
+cat(sprintf(
+  "\n**Reading this chart:** Peak RAM usage was **%s%%**, leaving a minimum of **%s%%** available. %s A flat, stable line is ideal — a rising red line over time would indicate a memory leak in one of the running programs.",
+  ram_used_max, ram_avail_min, status
+))
+```
+
+\newpage
+
+# Network
+
+The Pi has several **network interfaces** — physical ports or wireless links through which data travels. In the Hyperloop vehicle each interface connects to a different part of the system: some carry sensor data from the boards, others connect to the control laptop or external infrastructure.
+
+**RX and TX** are standard networking abbreviations used throughout this section:
+
+- **RX (Receive)** — data *arriving at* the Pi from outside. In the Hyperloop context this is mainly the sensor packets sent by the boards: speed, temperature, pressure readings, etc. A healthy RX means the Pi is successfully receiving data from the vehicle.
+- **TX (Transmit)** — data *leaving* the Pi towards another device. This includes forwarded packets, responses to requests, or data sent to the control laptop. A healthy TX means the Pi is successfully delivering data to its destinations.
+
+Think of it like a post office: **RX is the incoming mail** (letters arriving from the boards), **TX is the outgoing mail** (letters the Pi sends on to their final destination).
+
+This section analyses each interface separately so it is clear which link is under load and which is idle. For each interface the following is shown:
+
+- A **summary table** with the total data transferred and average rate during the session
+- A **throughput chart** showing how busy the link was over time
+- A **packet drops chart** showing whether any packets were lost on that specific link
+
+```{r network-sections, results='asis', fig.height=3.5}
+if (length(ifaces) == 0) {
+
+  cat("No network interface data found in CSV.\n")
+
+} else {
+
+  for (iface in ifaces) {
+
+    rx_b_col  <- paste0(iface, "_rx_bytes")
+    tx_b_col  <- paste0(iface, "_tx_bytes")
+    rx_ps_col <- paste0(iface, "_rx_bytes_per_s")
+    tx_ps_col <- paste0(iface, "_tx_bytes_per_s")
+    rx_p_col  <- paste0(iface, "_rx_pkts")
+    tx_p_col  <- paste0(iface, "_tx_pkts")
+    rx_d_col  <- paste0(iface, "_rx_drops")
+    tx_d_col  <- paste0(iface, "_tx_drops")
+
+    # ── Section header ──────────────────────────────────────────────────────
+    cat(sprintf("\n## Interface: %s\n\n", iface))
+
+    # ── Summary table ───────────────────────────────────────────────────────
+    iface_summary <- df %>%
+      summarise(
+        `Total RX`         = paste0(round(sum(.data[[rx_b_col]], na.rm=TRUE)/1024/1024, 2), " MB"),
+        `Total TX`         = paste0(round(sum(.data[[tx_b_col]], na.rm=TRUE)/1024/1024, 2), " MB"),
+        `Avg RX rate`      = paste0(round(mean(.data[[rx_ps_col]], na.rm=TRUE)/1024, 1), " KB/s"),
+        `Avg TX rate`      = paste0(round(mean(.data[[tx_ps_col]], na.rm=TRUE)/1024, 1), " KB/s"),
+        `Total RX packets` = as.character(sum(.data[[rx_p_col]], na.rm=TRUE)),
+        `Total TX packets` = as.character(sum(.data[[tx_p_col]], na.rm=TRUE)),
+        `RX drops`         = as.character(sum(.data[[rx_d_col]], na.rm=TRUE)),
+        `TX drops`         = as.character(sum(.data[[tx_d_col]], na.rm=TRUE))
+      ) %>%
+      pivot_longer(everything(), names_to = "Metric", values_to = "Value")
+
+    print(knitr::kable(iface_summary, booktabs = TRUE, align = c("l","r"),
+                       caption = paste0("Summary for interface ", iface)))
+
+    cat("\n")
+
+    # ── Throughput chart ────────────────────────────────────────────────────
+    net_iface <- bind_rows(
+      df %>% select(t, snap, bytes_per_s = all_of(rx_ps_col)) %>% mutate(dir = "RX"),
+      df %>% select(t, snap, bytes_per_s = all_of(tx_ps_col)) %>% mutate(dir = "TX")
+    ) %>% mutate(mbps = bytes_per_s / 1024 / 1024)
+
+    p_tput <- ggplot(net_iface, aes(x = .data[[x_var]], y = mbps,
+                                    color = dir, group = dir)) +
+      geom_line(linewidth = 1) +
+      geom_point(size = 1.5) +
+      scale_color_manual(values = c(RX = "#2166ac", TX = "#d6604d")) +
+      scale_y_continuous(labels = function(x) paste0(x, " MB/s")) +
+      labs(title    = paste0(iface, " — throughput"),
+           subtitle = "RX = data arriving at the Pi  |  TX = data leaving the Pi",
+           x = x_label, y = "MB/s")
+
+    print(p_tput)
+
+    # ── Throughput interpretation ───────────────────────────────────────────
+    avg_rx <- round(mean(df[[rx_ps_col]], na.rm=TRUE)/1024, 1)
+    avg_tx <- round(mean(df[[tx_ps_col]], na.rm=TRUE)/1024, 1)
+    max_rx <- round(max(df[[rx_ps_col]], na.rm=TRUE)/1024, 1)
+
+    dominant <- if (avg_rx > avg_tx) "incoming (RX)" else "outgoing (TX)"
+
+    cat(sprintf(
+      "\n**Reading this chart:** On interface **%s** the average throughput was **%s KB/s RX** and **%s KB/s TX**, with a peak of **%s KB/s** on the receiving side. Traffic was predominantly %s. A flat line at zero for either direction would indicate the link was inactive during this window.\n\n",
+      iface, avg_rx, avg_tx, max_rx, dominant
+    ))
+
+    # ── Packet drops chart ──────────────────────────────────────────────────
+    drops_iface <- bind_rows(
+      df %>% select(t, snap, drops = all_of(rx_d_col)) %>% mutate(dir = "RX drops"),
+      df %>% select(t, snap, drops = all_of(tx_d_col)) %>% mutate(dir = "TX drops")
+    )
+
+    p_drops <- ggplot(drops_iface, aes(x = .data[[x_var]], y = drops, fill = dir)) +
+      geom_col(position = "dodge", alpha = 0.85, width = 0.6) +
+      geom_text(aes(label = ifelse(drops > 0, drops, "")),
+                position = position_dodge(0.6), vjust = -0.4, size = 2.5) +
+      scale_fill_manual(values = c(`RX drops` = "#2166ac", `TX drops` = "#d6604d")) +
+      labs(title    = paste0(iface, " — packet drops per window"),
+           subtitle = "Non-zero values mean packets were discarded on this interface",
+           x = x_label, y = "Dropped packets")
+
+    print(p_drops)
+
+    # ── Drops interpretation ────────────────────────────────────────────────
+    total_rx_drops <- sum(df[[rx_d_col]], na.rm=TRUE)
+    total_tx_drops <- sum(df[[tx_d_col]], na.rm=TRUE)
+
+    if (total_rx_drops == 0 && total_tx_drops == 0) {
+      cat(sprintf(
+        "\n**Reading this chart:** No packets were dropped on interface **%s** during this session. All data was successfully processed.\n\n",
+        iface
+      ))
+    } else {
+      cat(sprintf(
+        "\n**Reading this chart:** Interface **%s** dropped **%d RX** and **%d TX** packets during this session. Drops at the interface level typically indicate a hardware or driver bottleneck rather than a software one.\n\n",
+        iface, total_rx_drops, total_tx_drops
+      ))
+    }
+
+    cat("\\newpage\n\n")
+  }
+}
+```
+
+# UDP Traffic
+
+**UDP** is the communication protocol used by the vehicle's boards to transmit their sensor data to the Pi at high speed. Unlike TCP, UDP does not ask for confirmation that each packet was received — this makes it very fast but also means that if the Pi cannot keep up, packets are **silently and permanently discarded**. There is no automatic retry.
+
+## Packet rate
+
+This chart shows how many UDP packets per second the Pi received and sent during each measurement window. A high and stable rate is normal and expected given the number of boards transmitting simultaneously. A sudden drop could indicate that a board stopped sending, a cable was unplugged, or the Pi became too busy to accept new packets.
+
+```{r udp-rate}
+udp_rate <- df %>%
+  select(t, snap, `In` = udp_in_pkt_per_s, `Out` = udp_out_pkt_per_s) %>%
+  pivot_longer(-c(t, snap), names_to = "dir", values_to = "pkt_per_s")
+
+ggplot(udp_rate, aes(x = .data[[x_var]], y = pkt_per_s, color = dir, group = dir)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c(`In` = "#2166ac", `Out` = "#d6604d")) +
+  labs(title    = "UDP packet rate",
+       subtitle = "Packets processed per second during each sampling window",
+       x = x_label, y = "Packets / s")
+```
+
+```{r udp-rate-interpretation, results='asis'}
+avg_in  <- round(mean(df$udp_in_pkt_per_s,  na.rm=TRUE))
+avg_out <- round(mean(df$udp_out_pkt_per_s, na.rm=TRUE))
+max_in  <- max(df$udp_in_pkt_per_s, na.rm=TRUE)
+
+cat(sprintf(
+  "\n**Reading this chart:** The Pi processed an average of **%d packets/s in** and **%d packets/s out**, peaking at **%d packets/s** incoming. The difference between In and Out is normal: not all received packets are forwarded — some are consumed by the Pi's own processes.\n",
+  avg_in, avg_out, max_in
+))
+```
+
+## Dropped packets (buffer overflow)
+
+This is the **most critical metric** in this report. When UDP packets arrive faster than the Pi can process them, the operating system stores them temporarily in a small waiting queue called the **receive buffer**. If that buffer fills up completely before the Pi has had a chance to read it, new incoming packets are discarded — they are **permanently lost** and will never reach their destination.
+
+Each bar represents the number of packets dropped during one measurement window.
+
+```{r udp-drops}
+ggplot(df, aes(x = .data[[x_var]], y = udp_recv_buf_errors)) +
+  geom_col(fill = "#d6604d", alpha = 0.85, width = 0.6) +
+  geom_text(aes(label = udp_recv_buf_errors),
+            vjust = -0.4, size = 3, color = "grey30") +
+  labs(title    = "UDP receive buffer errors (dropped packets) per window",
+       subtitle = "Any non-zero bar means data from the boards was permanently lost",
+       x = x_label, y = "Dropped packets")
+```
+
+```{r udp-drop-warning, results='asis'}
+total_drops <- sum(df$udp_recv_buf_errors, na.rm = TRUE)
+max_drops   <- max(df$udp_recv_buf_errors, na.rm = TRUE)
+
+if (total_drops > 0) {
+  cat(sprintf(
+    "\n**Reading this chart:** A total of **%d UDP packets were dropped** across all snapshots, with a single-window peak of **%d**. This means the Pi was unable to process all incoming data at some point during the session. Possible causes: CPU overload, insufficient receive buffer size, or boards transmitting at a rate higher than the Pi can sustain. Recommended actions: increase the kernel UDP receive buffer (`net.core.rmem_max`), reduce the sending rate from the boards, or offload processing to a dedicated machine.\n",
+    total_drops, max_drops
+  ))
+} else {
+  cat(sprintf(
+    "\n**Reading this chart:** All bars are zero — **no UDP packets were dropped** during this session. The Pi successfully processed all incoming traffic from the boards without any data loss.\n"
+  ))
+}
+```
